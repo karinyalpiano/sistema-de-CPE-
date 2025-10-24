@@ -1,0 +1,558 @@
+import os
+import platform
+import sqlite3
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from ipaddress import ip_address as _ipaddr
+import json, urllib.request, urllib.parse, datetime as dt
+from threading import Thread
+
+from flask import (
+    Flask, request, jsonify, render_template, abort,
+    redirect, url_for, Response, flash
+)
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user,
+    current_user, login_required
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from apscheduler.schedulers.background import BackgroundScheduler
+from werkzeug.exceptions import HTTPException
+
+print("Bibliotecas importadas com sucesso!")
+
+# -----------------------------------------------------------------------------
+# App e Config
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+DATABASE = os.environ.get("CPE_DB_PATH", "inventario_cpes.db")
+scheduler = BackgroundScheduler()
+
+def get_db_connection():
+    """Abre conexão com PRAGMA e row_factory habilitados."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def create_database():
+    """Cria/garante todas as tabelas e índices."""
+    with get_db_connection() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS Cliente (
+            id_cliente INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            cpf_cnpj TEXT UNIQUE NOT NULL,
+            endereco_instalacao TEXT,
+            telefone_contato TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS Usuario (
+            id_usuario INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS Equipamento (
+            id_cpe INTEGER PRIMARY KEY AUTOINCREMENT,
+            serial_number TEXT UNIQUE NOT NULL,
+            modelo TEXT NOT NULL,
+            ip_local TEXT UNIQUE NOT NULL,
+            data_instalacao DATE,
+            status_inventario TEXT,
+            id_cliente INTEGER NOT NULL,
+            FOREIGN KEY (id_cliente) REFERENCES Cliente (id_cliente) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS StatusHistorico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_cpe INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('Online','Offline','Timeout','Erro')),
+            rtt_ms INTEGER,
+            ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (id_cpe) REFERENCES Equipamento(id_cpe) ON DELETE CASCADE
+        );
+
+        -- Estado para evitar spam de alertas
+        CREATE TABLE IF NOT EXISTS AlertState (
+            id_cpe INTEGER PRIMARY KEY,
+            last_status TEXT,
+            last_alert_ts TEXT,
+            FOREIGN KEY (id_cpe) REFERENCES Equipamento(id_cpe) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_status_ts ON StatusHistorico(ts);
+        CREATE INDEX IF NOT EXISTS idx_status_cpe_ts ON StatusHistorico(id_cpe, ts DESC);
+        """)
+
+    print(f"Banco de dados '{DATABASE}' verificado/criado com sucesso.")
+
+    # cria admin padrão se não existir
+    admin_user = os.environ.get("ADMIN_USER", "admin")
+    admin_pass = os.environ.get("ADMIN_PASS", "admin123")
+    with get_db_connection() as c:
+        row = c.execute("SELECT 1 FROM Usuario WHERE username = ?", (admin_user,)).fetchone()
+        if not row:
+            c.execute(
+                "INSERT INTO Usuario (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                (admin_user, generate_password_hash(admin_pass))
+            )
+            c.commit()
+            print(f"Usuário admin criado: {admin_user} / (senha definida via env ADMIN_PASS)")
+
+# -----------------------------
+# Utilidades
+# -----------------------------
+def _is_valid_ipv4(s: str) -> bool:
+    try:
+        return _ipaddr(s).version == 4
+    except ValueError:
+        return False
+
+def send_telegram_message(text: str):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data)) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+def _ping_status(ip: str):
+    """Retorna tuple: (status, rtt_ms)"""
+    try:
+        if platform.system().lower().startswith("win"):
+            cmd = ["ping", "-n", "1", "-w", "1000", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        ok = (res.returncode == 0)
+        status = "Online" if ok else "Offline"
+        rtt = None
+        if ok and "time=" in res.stdout:
+            try:
+                part = res.stdout.split("time=")[1]
+                num = "".join(ch for ch in part.split()[0] if ch.isdigit() or ch == ".")
+                rtt = int(float(num))
+            except Exception:
+                rtt = None
+        return status, rtt
+    except subprocess.TimeoutExpired:
+        return "Timeout", None
+    except Exception:
+        return "Erro", None
+
+# ---------------------------------
+# Auth
+# ----------------------------------
+class User(UserMixin):
+    def __init__(self, id_usuario, username, is_admin):
+        self.id = id_usuario
+        self.username = username
+        self.is_admin = bool(is_admin)
+
+@login_manager.user_loader
+def load_user(user_id):
+    with get_db_connection() as conn:
+        u = conn.execute(
+            "SELECT id_usuario, username, is_admin FROM Usuario WHERE id_usuario = ?",
+            (user_id,)
+        ).fetchone()
+        if not u:
+            return None
+        return User(u["id_usuario"], u["username"], u["is_admin"])
+
+# --------------------------------------
+# Rotas de páginas
+# --------------------------------------
+@app.route("/")
+@login_required
+def index():
+    return render_template("index.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+
+    data = request.form or request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not username or not password:
+        flash("Informe usuário e senha.", "error")
+        return render_template("login.html"), 400
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT id_usuario, username, password_hash, is_admin FROM Usuario WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+    if not row or not check_password_hash(row["password_hash"], password):
+        flash("Credenciais inválidas.", "error")
+        return render_template("login.html"), 401
+
+    user = User(row["id_usuario"], row["username"], row["is_admin"])
+    login_user(user)
+    return redirect(url_for("index"))
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+# -------------------------------------
+# APIs
+# -------------------------------------
+@app.route("/api/health")
+def health():
+    return jsonify(status="ok")
+
+@app.route("/api/status_cpe/<ip>", methods=["GET"])
+def check_cpe_status(ip):
+    """Verifica o status via ping (não grava histórico)."""
+    if not _is_valid_ipv4(ip):
+        return jsonify({"error": "IP inválido"}), 400
+    status, rtt = _ping_status(ip)
+    label = "Offline (Tempo Esgotado)" if status == "Timeout" else "Erro no Ping" if status == "Erro" else status
+    return jsonify({"ip": ip, "status": label, "rtt_ms": rtt})
+
+@app.route("/api/equipamentos", methods=["GET"])
+def listar_equipamentos():
+    with get_db_connection() as conn:
+        rows = conn.execute("""
+            SELECT e.*, c.nome AS nome_cliente, c.cpf_cnpj
+            FROM Equipamento e
+            JOIN Cliente c ON e.id_cliente = c.id_cliente
+            ORDER BY e.data_instalacao DESC, e.id_cpe DESC;
+        """).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/equipamentos", methods=["POST"])
+def adicionar_equipamento():
+    """Cria cliente (se necessário) e insere equipamento."""
+    data = request.get_json(silent=True) or {}
+    required = ["nome_cliente", "cpf_cnpj", "endereco", "serial_number", "modelo", "ip_local"]
+    missing = [k for k in required if not str(data.get(k, "")).strip()]
+    if missing:
+        return jsonify({"error": f"Campos obrigatórios ausentes: {', '.join(missing)}"}), 400
+    if not _is_valid_ipv4(data["ip_local"]):
+        return jsonify({"error": "IP inválido"}), 400
+
+    with get_db_connection() as conn:
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO Cliente (nome, cpf_cnpj, endereco_instalacao, telefone_contato)
+                VALUES (?, ?, ?, ?);
+            """, (
+                data["nome_cliente"].strip(), data["cpf_cnpj"].strip(),
+                data["endereco"].strip(), (data.get("telefone") or "").strip()
+            ))
+            cliente = conn.execute(
+                "SELECT id_cliente FROM Cliente WHERE cpf_cnpj = ?;",
+                (data["cpf_cnpj"].strip(),)
+            ).fetchone()
+            if not cliente:
+                return jsonify({"error": "Falha ao localizar/criar cliente."}), 500
+
+            conn.execute("""
+                INSERT INTO Equipamento
+                    (serial_number, modelo, ip_local, data_instalacao, status_inventario, id_cliente)
+                VALUES (?, ?, ?, DATE('now'), 'Instalado', ?);
+            """, (
+                data["serial_number"].strip(), data["modelo"].strip(),
+                data["ip_local"].strip(), cliente["id_cliente"]
+            ))
+            conn.commit()
+            return jsonify({"message": "Equipamento cadastrado com sucesso!"}), 201
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "Número de Série ou IP já cadastrado."}), 409
+        except Exception as e:
+            return jsonify({"error": f"Erro no cadastro: {e}"}), 500
+
+@app.route("/api/equipamentos/<int:id_cpe>", methods=["GET", "PUT", "DELETE"])
+def equipamento_detalhe(id_cpe: int):
+    with get_db_connection() as conn:
+        if request.method == "GET":
+            row = conn.execute("""
+                SELECT e.*, c.nome AS nome_cliente, c.cpf_cnpj
+                FROM Equipamento e
+                JOIN Cliente c ON e.id_cliente = c.id_cliente
+                WHERE e.id_cpe = ?;
+            """, (id_cpe,)).fetchone()
+            if not row:
+                abort(404, description="Equipamento não encontrado")
+            return jsonify(dict(row))
+
+        if request.method == "PUT":
+            data = request.get_json(silent=True) or {}
+            current = conn.execute("SELECT * FROM Equipamento WHERE id_cpe = ?;", (id_cpe,)).fetchone()
+            if not current:
+                abort(404, description="Equipamento não encontrado")
+
+            serial = data.get("serial_number", current["serial_number"]).strip()
+            modelo = data.get("modelo", current["modelo"]).strip()
+            ip     = data.get("ip_local", current["ip_local"]).strip()
+            status = data.get("status_inventario", current["status_inventario"])
+
+            if ip and not _is_valid_ipv4(ip):
+                return jsonify({"error": "IP inválido"}), 400
+
+            try:
+                conn.execute("""
+                    UPDATE Equipamento
+                    SET serial_number = ?, modelo = ?, ip_local = ?, status_inventario = ?
+                    WHERE id_cpe = ?;
+                """, (serial, modelo, ip, status, id_cpe))
+                conn.commit()
+                return jsonify({"message": "Equipamento atualizado com sucesso."})
+            except sqlite3.IntegrityError:
+                return jsonify({"error": "Número de Série ou IP já cadastrado."}), 409
+
+        if request.method == "DELETE":
+            cur = conn.execute("DELETE FROM Equipamento WHERE id_cpe = ?;", (id_cpe,))
+            conn.commit()
+            if cur.rowcount == 0:
+                abort(404, description="Equipamento não encontrado")
+            return jsonify({"message": "Equipamento removido."})
+
+@app.route("/api/equipamentos/search", methods=["GET"])
+def buscar_equipamentos():
+    page = max(int(request.args.get("page", 1)), 1)
+    per  = min(max(int(request.args.get("per_page", 20)), 1), 100)
+    q    = (request.args.get("q", "") or "").strip()
+
+    offset = (page - 1) * per
+    with get_db_connection() as conn:
+        where = ""
+        params = []
+        if q:
+            where = "WHERE e.serial_number LIKE ? OR c.nome LIKE ? OR e.modelo LIKE ? OR e.ip_local LIKE ?"
+            like = f"%{q}%"
+            params = [like, like, like, like]
+
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM Equipamento e JOIN Cliente c ON e.id_cliente=c.id_cliente {where};",
+            params
+        ).fetchone()[0]
+        rows = conn.execute(f"""
+            SELECT e.*, c.nome AS nome_cliente, c.cpf_cnpj
+            FROM Equipamento e JOIN Cliente c ON e.id_cliente = c.id_cliente
+            {where}
+            ORDER BY e.data_instalacao DESC, e.id_cpe DESC
+            LIMIT ? OFFSET ?;
+        """, (*params, per, offset)).fetchall()
+
+    return jsonify({
+        "items": [dict(r) for r in rows],
+        "page": page, "per_page": per, "total": total
+    })
+
+@app.route("/api/dashboard/last_status", methods=["GET"])
+def dashboard_last_status():
+    """Último status de cada CPE."""
+    with get_db_connection() as conn:
+        rows = conn.execute("""
+            SELECT e.id_cpe, e.serial_number, e.modelo, e.ip_local,
+                   h.status, h.ts
+            FROM Equipamento e
+            LEFT JOIN (
+                SELECT h1.*
+                FROM StatusHistorico h1
+                JOIN (
+                    SELECT id_cpe, MAX(ts) AS max_ts
+                    FROM StatusHistorico
+                    GROUP BY id_cpe
+                ) m ON m.id_cpe = h1.id_cpe AND m.max_ts = h1.ts
+            ) h ON h.id_cpe = e.id_cpe
+            ORDER BY e.serial_number;
+        """).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/dashboard/availability", methods=["GET"])
+def dashboard_availability():
+    """Disponibilidade (em %) no período solicitado (padrão: 7 dias)."""
+    days = int(request.args.get("days", 7))
+    with get_db_connection() as conn:
+        rows = conn.execute("""
+            SELECT e.id_cpe, e.serial_number,
+                   ROUND(AVG(CASE WHEN h.status='Online' THEN 1.0 ELSE 0 END) * 100, 1) AS disponibilidade_pct
+            FROM Equipamento e
+            LEFT JOIN StatusHistorico h
+                ON h.id_cpe = e.id_cpe
+               AND h.ts >= DATETIME('now', ?)
+            GROUP BY e.id_cpe, e.serial_number
+            ORDER BY disponibilidade_pct DESC;
+        """, (f"-{days} days",)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/equipamentos/export.csv", methods=["GET"])
+@login_required
+def exportar_csv():
+    with get_db_connection() as conn:
+        rows = conn.execute("""
+            SELECT e.serial_number, e.modelo, c.nome AS nome_cliente, e.ip_local, e.data_instalacao, e.status_inventario
+            FROM Equipamento e JOIN Cliente c ON e.id_cliente = c.id_cliente
+            ORDER BY e.serial_number;
+        """).fetchall()
+    # gera CSV 
+    header = "serial_number,modelo,nome_cliente,ip_local,data_instalacao,status_inventario\n"
+    lines = [
+        f"{r['serial_number']},{r['modelo']},{r['nome_cliente']},{r['ip_local']},{r['data_instalacao']},{r['status_inventario']}"
+        for r in rows
+    ]
+    csv = header + "\n".join(lines)
+    return Response(
+        csv,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inventario_cpes.csv"}
+    )
+
+def evaluate_alerts(now_ts=None):
+    """Dispara alerta quando CPE fica offline por X minutos e evita spam."""
+    minutes = int(os.environ.get("ALERT_OFFLINE_MINUTES", "10"))
+    cutoff = f"-{minutes} minutes"
+    now_ts = now_ts or dt.datetime.now(dt.timezone.utc)
+
+    with get_db_connection() as conn:
+        rows = conn.execute("""
+            WITH last AS (
+              SELECT h.id_cpe, h.status, MAX(h.ts) AS ts
+              FROM StatusHistorico h
+              WHERE h.ts >= DATETIME('now', ?)
+              GROUP BY h.id_cpe
+            )
+            SELECT e.id_cpe, e.serial_number, e.ip_local, l.status, l.ts
+            FROM Equipamento e
+            LEFT JOIN last l ON l.id_cpe = e.id_cpe;
+        """, (cutoff,)).fetchall()
+
+        for r in rows:
+            if not r["status"]: 
+                continue
+            offline = r["status"] != "Online"
+            if not offline:
+                conn.execute(
+                    "REPLACE INTO AlertState (id_cpe, last_status, last_alert_ts) VALUES (?, ?, NULL)",
+                    (r["id_cpe"], r["status"])
+                )
+                continue
+
+            st = conn.execute(
+                "SELECT last_alert_ts FROM AlertState WHERE id_cpe = ?",
+                (r["id_cpe"],)
+            ).fetchone()
+            recent_alert = False
+            if st and st["last_alert_ts"]:
+                try:
+                    last = dt.datetime.fromisoformat(st["last_alert_ts"])  # preferido
+                except ValueError:
+                    last = dt.datetime.fromisoformat(st["last_alert_ts"].replace("Z", ""))  # compatibilidade
+                recent_alert = (now_ts - last) < dt.timedelta(minutes=minutes)
+
+            if recent_alert:
+                continue
+
+            ok = send_telegram_message(
+                f"⚠️ CPE OFFLINE: {r['serial_number']} ({r['ip_local']}) — status: {r['status']}"
+            )
+            if ok:
+                conn.execute(
+                    "REPLACE INTO AlertState (id_cpe, last_status, last_alert_ts) VALUES (?, ?, ?)",
+                    (r["id_cpe"], r["status"], now_ts.isoformat())
+                )
+        conn.commit()
+def log_status_for_all():
+    """Ping paralelo de todos os CPEs e grava no histórico, depois avalia alertas."""
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT id_cpe, ip_local FROM Equipamento;").fetchall()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        futures = [ex.submit(_ping_status, r["ip_local"]) for r in rows]
+        for r, fut in zip(rows, futures):
+            status_key, rtt = fut.result()
+            results.append((r["id_cpe"], status_key, rtt))
+
+    if results:
+        with get_db_connection() as conn:
+            conn.executemany(
+                "INSERT INTO StatusHistorico (id_cpe, status, rtt_ms) VALUES (?, ?, ?);",
+                results
+            )
+            conn.commit()
+
+    try:
+        evaluate_alerts()
+    except Exception as e:
+        print(f"[evaluate_alerts] erro: {e}")
+
+def start_scheduler():
+    """Evita múltiplas instâncias no modo debug e em produção."""
+    if not scheduler.running:
+        scheduler.add_job(
+            log_status_for_all,
+            'interval',
+            minutes=int(os.environ.get("PING_INTERVAL_MINUTES", "5")),
+            id='ping_all',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True
+        )
+        scheduler.start()
+        print("Scheduler iniciado.")
+        # roda uma passada inicial em thread pra não travar o boot
+        Thread(target=log_status_for_all, daemon=True).start()
+
+@app.errorhandler(HTTPException)
+def _json_http_errors(e):
+    if request.path.startswith("/api/"):
+        return jsonify(error=e.description or e.name), e.code
+    return e
+
+def _run():
+    create_database()
+    is_reloader = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    if not app.debug or is_reloader:
+        start_scheduler()
+
+    app.run(debug=True)
+
+if __name__ == "__main__":
+    _run()
+
+login_manager.login_view = "login"
+
+@login_manager.unauthorized_handler
+def _unauth():
+    return redirect(url_for("login"))
+
+login_manager.login_view = "login"
+
+@login_manager.unauthorized_handler
+def _unauth():
+    return redirect(url_for("login"))
+
+_PUBLIC_ENDPOINTS = {"login", "static"} 
+_PUBLIC_PATHS = {"/api/health", "/favicon.ico"}
+
+@app.before_request
+def _require_login_everywhere():
+    if request.endpoint in _PUBLIC_ENDPOINTS or request.path in _PUBLIC_PATHS:
+        return
+
+    if not current_user.is_authenticated:
+        return redirect(url_for("login"))
+

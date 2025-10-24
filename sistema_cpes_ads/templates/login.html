@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login • Inventário de CPEs</title>
+
+  <link rel="icon" href="{{ url_for('static', filename='img/favicon.png') }}" type="image/png">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+  <script>
+    (function () {
+      try {
+        var saved = (localStorage.getItem('theme') || '').toLowerCase();
+        var initial = (saved === 'light' || saved === 'dark')
+          ? saved
+          : ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', initial);
+        document.documentElement.style.colorScheme = initial;
+        if (!(saved === 'light' || saved === 'dark')) localStorage.setItem('theme', initial);
+      } catch (e) {}
+    })();
+  </script>
+
+  <style>
+    :root { --login-width: clamp(320px, 92vw, 480px); }
+
+    body.login-page {
+      min-height: 100dvh; margin: 0; display: grid; place-items: center;
+      background:
+        radial-gradient(1200px 700px at -10% -20%, color-mix(in srgb, var(--primary) 14%, transparent), transparent 60%),
+        radial-gradient(900px 600px at 110% 5%,  color-mix(in srgb, var(--success) 12%, transparent), transparent 60%),
+        var(--bg);
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Canvas do efeito */
+    .login-fx {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      opacity: .55;
+    }
+    :root[data-theme="light"] .login-fx { opacity: .62; }
+    :root[data-theme="dark"]  .login-fx { opacity: .50; }
+
+    .login-layout {
+      width: min(1180px, 96vw);
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 22px;
+      align-items: stretch;
+      position: relative;
+      z-index: 1; /* garante que o conteúdo fique acima do canvas */
+    }
+
+    /* Painel de marca (esquerda) */
+    .brand-side {
+      position: relative;
+      border-radius: var(--radius, 14px);
+      background:
+        linear-gradient(180deg, color-mix(in srgb, var(--primary) 22%, transparent), color-mix(in srgb, var(--success) 20%, transparent)),
+        var(--card);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      padding: clamp(18px, 3.5vw, 28px);
+      overflow: hidden;
+      display: grid;
+      align-content: center;
+      gap: 14px;
+    }
+    .brand-kicker {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
+      background: color-mix(in srgb, var(--primary) 12%, var(--card));
+      font-weight: 700; font-size: 12px; width: fit-content;
+    }
+    .brand-headline { display: grid; grid-template-columns: 56px 1fr; gap: 14px; align-items: center; }
+    .brand-headline img { width: 56px; height: 56px; border-radius: 12px; }
+    .brand-headline h1 { margin: 0; line-height: 1.15; font-size: clamp(1.2rem, 2.6vw, 1.6rem); }
+    .brand-copy { color: #8091ad; margin: 6px 0 0; max-width: 48ch; }
+
+    .brand-stats { margin-top: 10px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+    .brand-stats .stat {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px; text-align: center; box-shadow: var(--shadow-sm);
+    }
+    .stat .num { font-weight: 800; font-size: 1.15rem; line-height: 1; }
+    .stat small { color: #6b7280; display: block; margin-top: 6px; }
+
+    /* Cartão de login (direita) */
+    .form-side { display: grid; align-content: center; }
+    .login-card {
+      width: var(--login-width);
+      background: var(--card); color: var(--text); border: 1px solid var(--border);
+      border-radius: var(--radius, 14px); padding: 22px 22px 18px; box-shadow: var(--shadow);
+      margin-inline: auto;
+    }
+    .login-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .login-title { margin: 0; font-size: 1.25rem; line-height: 1.2; }
+    .login-sub { margin: 4px 0 0; color: #6b7280; }
+
+    .theme-toggle.login-theme { position: static; margin-left: auto; }
+
+    .form-group { margin: 12px 0 14px; }
+    .input-wrap { position: relative; }
+    .input-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; opacity: .7; pointer-events: none; }
+    .input-wrap input {
+      width: 100%; padding: 11px 12px 11px 36px; border-radius: 12px; border: 1px solid var(--border);
+      background: var(--card); color: var(--text); outline: none; transition: border .2s, box-shadow .2s;
+    }
+    .input-wrap input:focus { border-color: var(--primary-600); box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 18%, transparent); }
+
+    .password-wrap { position: relative; }
+    .password-wrap input { padding-right: 46px; }
+    .toggle-pass {
+      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+      display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--card); cursor: pointer; transition: filter .15s ease, transform .06s ease;
+    }
+    .toggle-pass:hover  { filter: brightness(.98); }
+    .toggle-pass:active { transform: translateY(1px); }
+    .toggle-pass[aria-pressed="true"] { background: color-mix(in srgb, var(--primary) 10%, var(--card)); }
+    .toggle-pass svg { width: 18px; height: 18px; }
+
+    .login-btn {
+      width: 100%; padding: 11px 14px; border-radius: 12px; font-weight: 700;
+      background: var(--primary); color: #fff; border: 0; cursor: pointer;
+      box-shadow: var(--shadow-sm); transition: transform .06s ease, filter .2s ease;
+    }
+    .login-btn:hover  { filter: brightness(.98); }
+    .login-btn:active { transform: translateY(1px); }
+
+    .login-foot { margin-top: 12px; text-align: center; font-size: .85rem; color: #94a3b8; }
+
+    .error-messages {
+      list-style: none; margin: 10px 0 0; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+      background: color-mix(in srgb, var(--danger) 12%, var(--card));
+      color: color-mix(in srgb, var(--danger) 65%, var(--text));
+    }
+
+    @media (max-width: 980px) {
+      .login-layout { grid-template-columns: 1fr; gap: 16px; width: min(96vw, 760px); }
+      .brand-side { display: none; }
+      .theme-toggle.login-theme { position: fixed; top: 16px; right: 16px; }
+    }
+  </style>
+</head>
+
+<body class="login-page">
+  <canvas id="loginFX" class="login-fx" aria-hidden="true"></canvas>
+
+  <div class="login-layout">
+    <aside class="brand-side" aria-label="Apresentação">
+      <span class="brand-kicker">PRESTEK • Inventário de CPEs</span>
+      <div class="brand-headline">
+        <img src="{{ url_for('static', filename='img/favicon.png') }}" alt="Logo PRESTEK" width="56" height="56">
+        <div>
+          <h1>Conectando dados com clareza</h1>
+          <p class="brand-copy">Gerencie CPEs, acompanhe status em tempo real e mantenha o inventário sempre atualizado.</p>
+        </div>
+      </div>
+      <div class="brand-stats" aria-hidden="true">
+        <div class="stat"><div class="num">99,9%</div><small>Uptime alvo</small></div>
+        <div class="stat"><div class="num">7 dias</div><small>Histórico de status</small></div>
+        <div class="stat"><div class="num">CSV</div><small>Exportação rápida</small></div>
+      </div>
+    </aside>
+
+    <main class="form-side" role="main" aria-labelledby="login-title">
+      <div class="login-card">
+        <div class="login-top">
+          <div>
+            <h2 id="login-title" class="login-title">Acesso ao sistema</h2>
+            <p class="login-sub">Entre com suas credenciais</p>
+          </div>
+          <button id="themeToggleLogin" class="theme-toggle login-theme" type="button" aria-label="Alternar tema" aria-pressed="false" title="Alternar tema">
+            <span class="icon-moon" aria-hidden="true">🌙</span>
+            <span class="icon-sun" aria-hidden="true">☀️</span>
+          </button>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <ul class="error-messages" role="alert">
+              {% for category, message in messages %}
+                <li class="error">{{ message }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        {% endwith %}
+
+        <form method="POST" novalidate>
+          <div class="form-group">
+            <label for="username">Usuário</label>
+            <div class="input-wrap">
+              <svg class="input-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5Zm0 2c-4.33 0-8 2.17-8 5v1h16v-1c0-2.83-3.67-5-8-5Z"/></svg>
+              <input id="username" name="username" type="text" autocomplete="username" placeholder="Seu usuário" required autofocus>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="password">Senha</label>
+            <div class="input-wrap password-wrap">
+              <svg class="input-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C7 5 2.73 8.11 1 12c1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7Zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm0-3a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"/></svg>
+              <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Sua senha" required>
+              <button type="button" class="toggle-pass" id="togglePass" aria-label="Mostrar senha" aria-pressed="false" title="Mostrar senha">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5C7 5 2.73 8.11 1 12c1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7Zm0 12a5 5 0 1 1 0-10 5 5 0 0 1 0 10Z"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <button type="submit" class="login-btn">Entrar</button>
+        </form>
+
+        <div class="login-foot">© {{ (now or none) and now.year or '' }} PRESTEK • Acesso restrito</div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      const btn = document.getElementById('togglePass');
+      const input = document.getElementById('password');
+      if (!btn || !input) return;
+      function setVisible(show) {
+        input.type = show ? 'text' : 'password';
+        btn.setAttribute('aria-pressed', show ? 'true' : 'false');
+        btn.setAttribute('aria-label', show ? 'Ocultar senha' : 'Mostrar senha');
+        btn.title = show ? 'Ocultar senha' : 'Mostrar senha';
+      }
+      btn.addEventListener('click', () => setVisible(input.type === 'password'));
+      btn.addEventListener('pointerdown', (e) => { e.preventDefault(); setVisible(true); });
+      btn.addEventListener('pointerup',   () => setVisible(false));
+      btn.addEventListener('pointerleave',() => setVisible(false));
+    })();
+  </script>
+
+  <script>
+    (function () {
+      const canvas = document.getElementById('loginFX');
+      if (!canvas) return;
+
+      const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) { canvas.remove(); return; }
+
+      const ctx = canvas.getContext('2d', { alpha: true });
+      let W = 0, H = 0, dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      let raf = null;
+      let nodes = [];
+      let palette = { a:[96,165,250], b:[16,185,129] }; // fallback
+
+      function readRGB(varName) {
+        const el = document.documentElement;
+        const s = getComputedStyle(el).getPropertyValue(varName).trim();
+        if (!s) return null;
+        if (s.startsWith('#')) {
+          let hex = s.replace('#',''); if (hex.length===3) hex = hex.split('').map(c=>c+c).join('');
+          const n = parseInt(hex,16); return [ (n>>16)&255, (n>>8)&255, n&255 ];
+        }
+        const m = s.match(/rgba?\((\d+)[,\s]+(\d+)[,\s]+(\d+)/i);
+        return m ? [ +m[1], +m[2], +m[3] ] : null;
+      }
+      function updatePalette() {
+        palette.a = readRGB('--primary') || palette.a;
+        palette.b = readRGB('--success') || palette.b;
+      }
+
+      function resize() {
+        W = Math.round(innerWidth);
+        H = Math.round(innerHeight);
+        canvas.width = Math.floor(W*dpr);
+        canvas.height = Math.floor(H*dpr);
+        canvas.style.width = W+'px';
+        canvas.style.height = H+'px';
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+        spawn();
+      }
+
+      function spawn() {
+        const count = Math.round(Math.min(120, Math.max(40, (W*H)/18000)));
+        nodes = Array.from({length: count}, () => ({
+          x: Math.random()*W, y: Math.random()*H,
+          vx: (Math.random()-.5)*0.30, vy: (Math.random()-.5)*0.30,
+          r: Math.random()*1.6 + .6,
+          tw: Math.random()*Math.PI*2
+        }));
+      }
+
+      function lerp(a,b,t){ return a + (b-a)*t; }
+
+      function step() {
+        ctx.clearRect(0,0,W,H);
+        if (document.documentElement.getAttribute('data-theme') === 'dark') {
+          ctx.fillStyle = 'rgba(2,6,23,0.15)';
+          ctx.fillRect(0,0,W,H);
+        }
+
+        // linhas
+        for (let i=0;i<nodes.length;i++){
+          const n = nodes[i];
+          n.x += n.vx; n.y += n.vy;
+          n.tw += 0.002;
+          if (n.x < -20) n.x = W+20; if (n.x > W+20) n.x = -20;
+          if (n.y < -20) n.y = H+20; if (n.y > H+20) n.y = -20;
+
+          for (let j=i+1;j<nodes.length;j++){
+            const m = nodes[j];
+            const dx = n.x - m.x, dy = n.y - m.y;
+            const d2 = dx*dx + dy*dy;
+            if (d2 < 180*180) {
+              const d = Math.sqrt(d2);
+              const t = 1 - (d/180); // 0..1
+              const r = Math.round(lerp(palette.a[0], palette.b[0], t));
+              const g = Math.round(lerp(palette.a[1], palette.b[1], t));
+              const b = Math.round(lerp(palette.a[2], palette.b[2], t));
+              ctx.strokeStyle = `rgba(${r},${g},${b},${0.18*t})`;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(n.x, n.y);
+              ctx.lineTo(m.x, m.y);
+              ctx.stroke();
+            }
+          }
+        }
+
+        nodes.forEach(n=>{
+          const pulse = 0.6 + Math.sin(n.tw)*0.4;
+          const r = Math.round(lerp(palette.a[0], palette.b[0], pulse*0.5));
+          const g = Math.round(lerp(palette.a[1], palette.b[1], pulse*0.5));
+          const b = Math.round(lerp(palette.a[2], palette.b[2], pulse*0.5));
+          ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
+          ctx.shadowBlur = 12; ctx.shadowColor = `rgba(${r},${g},${b},0.35)`;
+          ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI*2); ctx.fill();
+          ctx.shadowBlur = 0;
+        });
+
+        raf = requestAnimationFrame(step);
+      }
+
+      function start(){ cancelAnimationFrame(raf); updatePalette(); resize(); step(); }
+
+      const mo = new MutationObserver(()=>{ updatePalette(); });
+      mo.observe(document.documentElement, { attributes:true, attributeFilter:['data-theme'] });
+
+      window.addEventListener('resize', ()=>{ cancelAnimationFrame(raf); requestAnimationFrame(start); });
+      document.addEventListener('visibilitychange', ()=>{ if (document.hidden) cancelAnimationFrame(raf); else start(); });
+
+      start();
+    })();
+  </script>
+
+  <script defer src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>

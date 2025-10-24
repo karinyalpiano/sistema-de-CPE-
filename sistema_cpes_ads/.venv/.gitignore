@@ -1,0 +1,85 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+/.mypy_cache/
+/.mruff_cache/
+/.pytype/
+*.pyo
+*.pyd
+
+# ---- Environments ----
+.env
+.env.*
+*.env
+.venv/
+venv/
+ENV/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---- Build / Dist ----
+build/
+dist/
+develop-eggs/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+sdist/
+*.manifest
+*.spec
+
+# ---- Logs ----
+*.log
+logs/
+*.pid
+
+# ---- SQLite / Databases ----
+*.db
+*.sqlite
+*.sqlite3
+db.sqlite3
+instance/
+Pex/inventario_cpes.db
+Pex/sistema_cpes_ads/inventario_cpes.db
+
+# ---- Flask / Runtime ----
+*.mo
+*.pot
+*.pyc
+*.pkl
+.cache/
+
+# ---- Frontend / Node (se existir) ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ---- Coverage / Reports ----
+coverage.xml
+*.cover
+*.lcov
+
+# ---- Compiled templates/assets (se gerados) ----
+/static/build/
+/static/dist/
+
+# ---- Docker (não ignore Dockerfile/compose) ----
+# Se gerar volumes temporários, ignore-os aqui:
+docker-data/
+
